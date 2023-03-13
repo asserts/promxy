@@ -27,8 +27,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -233,6 +233,11 @@ func (t *QueueManager) Append(s *model.Sample) error {
 	}
 
 	ls := relabel.Process(b.Labels(), t.relabelConfigs...)
+
+	// If there are no labels; don't queue the sample
+	if len(ls) < 1 {
+		return nil
+	}
 
 	snew.Metric = make(model.Metric, len(ls))
 	for _, label := range ls {

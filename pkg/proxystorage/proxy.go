@@ -3,15 +3,18 @@ package proxystorage
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -34,7 +37,7 @@ const MetricNameWorkaroundLabel = "__name"
 type proxyStorageState struct {
 	sgs            []*servergroup.ServerGroup
 	client         promclient.API
-	cfg            *proxyconfig.PromxyConfig
+	cfg            *proxyconfig.Config
 	remoteStorage  *remote.Storage
 	appender       storage.Appender
 	appenderCloser func() error
@@ -61,7 +64,7 @@ func (p *proxyStorageState) Cancel(n *proxyStorageState) {
 			sg.Cancel()
 		}
 	}
-	// We call close if the new one is nil, or if the appanders don't match
+	// We call close if the new one is nil, or if the appenders don't match
 	if n == nil || p.appender != n.appender {
 		if p.appenderCloser != nil {
 			p.appenderCloser()
@@ -98,7 +101,7 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 	apis := make([]promclient.API, len(c.ServerGroups))
 	newState := &proxyStorageState{
 		sgs: make([]*servergroup.ServerGroup, len(c.ServerGroups)),
-		cfg: &c.PromxyConfig,
+		cfg: c,
 	}
 	for i, sgCfg := range c.ServerGroups {
 		tmp := servergroup.New()
@@ -145,11 +148,92 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 
 	newState.Ready()        // Wait for the newstate to be ready
 	p.state.Store(newState) // Store the new state
-	if oldState != nil && oldState.appender != newState.appender {
+	if oldState != nil {
 		oldState.Cancel(newState) // Cancel the old one
 	}
 
 	return nil
+}
+
+func (p *ProxyStorage) ConfigHandler(w http.ResponseWriter, r *http.Request) {
+	state := p.GetState()
+	v := map[string]interface{}{
+		"status": "success",
+		"data": map[string]string{
+			"yaml": state.cfg.String(),
+		},
+	}
+
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	b, err := json.Marshal(v)
+	if err != nil {
+		logrus.Error("msg", "error marshaling json response", "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if n, err := w.Write(b); err != nil {
+		logrus.Error("msg", "error writing response", "bytesWritten", n, "err", err)
+	}
+}
+
+// MetadataHandler is an implementation of the metadata handler within the prometheus API
+func (p *ProxyStorage) MetadataHandler(w http.ResponseWriter, r *http.Request) {
+	// Check that "limit" is valid
+	var limit int
+	if s := r.FormValue("limit"); s != "" {
+		var err error
+		if limit, err = strconv.Atoi(s); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Do the metadata lookup
+	state := p.GetState()
+	metadata, err := state.client.Metadata(r.Context(), r.FormValue("metric"), r.FormValue("limit"))
+
+	// Trim the results to the requested limit
+	if len(metadata) > limit {
+		count := 0
+		for k := range metadata {
+			if count < limit {
+				count++
+			} else {
+				delete(metadata, k)
+			}
+		}
+	}
+
+	var v map[string]interface{}
+	if err != nil {
+		v = map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		}
+	} else {
+		v = map[string]interface{}{
+			"status": "success",
+			"data":   metadata,
+		}
+	}
+
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	b, err := json.Marshal(v)
+	if err != nil {
+		logrus.Error("msg", "error marshaling json response", "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if n, err := w.Write(b); err != nil {
+		logrus.Error("msg", "error writing response", "bytesWritten", n, "err", err)
+	}
+
 }
 
 // Querier returns a new Querier on the storage.
@@ -161,7 +245,7 @@ func (p *ProxyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Q
 		timestamp.Time(maxt).UTC(),
 		state.client,
 
-		state.cfg,
+		&state.cfg.PromxyConfig,
 	}, nil
 }
 
@@ -202,9 +286,9 @@ func (p *ProxyStorage) Stats(statsByLabelName string) (*tsdb.Stats, error) {
 // chunks of the query, farming them out to prometheus hosts, then stitching the results back together.
 // An example would be a sum, we can sum multiple sums and come up with the same result -- so we do.
 // There are a few ground rules for this:
-//      - Children cannot be AggregateExpr: aggregates have their own combining logic, so its not safe to send a subquery with additional aggregations
-//      - offsets within the subtree must match: if they don't then we'll get mismatched data, so we wait until we are far enough down the tree that they converge
-//      - Don't reduce accuracy/granularity: the intention of this is to get the correct data faster, meaning correctness overrules speed.
+//   - Children cannot be AggregateExpr: aggregates have their own combining logic, so its not safe to send a subquery with additional aggregations
+//   - offsets within the subtree must match: if they don't then we'll get mismatched data, so we wait until we are far enough down the tree that they converge
+//   - Don't reduce accuracy/granularity: the intention of this is to get the correct data faster, meaning correctness overrules speed.
 func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, node parser.Node, path []parser.Node) (parser.Node, error) {
 	isAgg := func(node parser.Node) bool {
 		_, ok := node.(*parser.AggregateExpr)
@@ -598,7 +682,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 		subEvalStmt.Start = s.Start.Add(-n.Offset).Add(-n.Range).Truncate(subEvalStmt.Interval)
 		if subEvalStmt.Start.Before(s.Start.Add(-n.Offset).Add(-n.Range)) {
-			subEvalStmt.Start.Add(subEvalStmt.Interval)
+			subEvalStmt.Start = subEvalStmt.Start.Add(subEvalStmt.Interval)
 		}
 
 		newN, err := parser.Inspect(ctx, &subEvalStmt, func(parser.Node, []parser.Node) error { return nil }, p.NodeReplacer)
