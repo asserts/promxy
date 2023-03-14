@@ -2,15 +2,13 @@ package proxyconfig
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"github.com/prometheus/exporter-toolkit/web"
-
 	"github.com/prometheus/prometheus/config"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/jacksontj/promxy/pkg/servergroup"
-
-	yaml "gopkg.in/yaml.v2"
 )
 
 // DefaultPromxyConfig is the default promxy config that the config file
@@ -24,7 +22,7 @@ func ConfigFromFile(path string) (*Config, error) {
 		PromConfig:   config.DefaultConfig,
 		PromxyConfig: DefaultPromxyConfig,
 	}
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error loading config: %v", err)
 	}
@@ -48,6 +46,14 @@ type Config struct {
 	PromxyConfig `yaml:"promxy"`
 
 	WebConfig web.TLSStruct `yaml:"tls_server_config"`
+}
+
+func (c *Config) String() string {
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Sprintf("<error creating config string: %s>", err)
+	}
+	return string(b)
 }
 
 // PromxyConfig is the configuration for Promxy itself

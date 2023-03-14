@@ -6,7 +6,7 @@ import (
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 // IgnoreErrorAPI simply swallows all errors from the given API. This allows the API to
@@ -63,4 +63,11 @@ func (n *IgnoreErrorAPI) Key() model.LabelSet {
 		return apiLabels.Key()
 	}
 	return nil
+}
+
+// Metadata returns metadata about metrics currently scraped by the metric name.
+func (n *IgnoreErrorAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	// TODO: query all and merge
+	v, _ := n.A.Metadata(ctx, metric, limit)
+	return v, nil
 }

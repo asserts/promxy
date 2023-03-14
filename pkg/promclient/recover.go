@@ -6,7 +6,7 @@ import (
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 // recoverAPI simply recovers all panics and returns them as errors
@@ -71,4 +71,14 @@ func (api *recoverAPI) GetValue(ctx context.Context, start, end time.Time, match
 		}
 	}()
 	return api.A.GetValue(ctx, start, end, matchers)
+}
+
+// Metadata returns metadata about metrics currently scraped by the metric name.
+func (api *recoverAPI) Metadata(ctx context.Context, metric, limit string) (v map[string][]v1.Metadata, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = r.(error)
+		}
+	}()
+	return api.A.Metadata(ctx, metric, limit)
 }
