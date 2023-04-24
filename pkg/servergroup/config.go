@@ -7,6 +7,8 @@ import (
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 
+	"github.com/jacksontj/promxy/pkg/promclient"
+
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/model/relabel"
 )
@@ -88,6 +90,35 @@ type Config struct {
 	// So in reality its "the same", the difference is in prometheus these apply to the labels/targets of a scrape job,
 	// in promxy they apply to the prometheus hosts in the servergroup - but the behavior is the same.
 	RelabelConfigs []*relabel.Config `yaml:"relabel_configs,omitempty"`
+	// MetricsRelabelConfigs are similar in spirit to prometheus' relabel config but quite different.
+	// As this relabeling is being done within the query-path all relabel actions need to be reversible
+	// so that we can alter queries (e.g. matchers) based on the relabel config. This is done by strictly
+	// limiting the rewrite capability to just those subset of actions that can be reversed. Similar to
+	// prometheus' relabel capability these rules are executed in an order -- so the rules can be compounded
+	// to create relatively complex relabel behavior.
+	// To showcase the versatility, lets look at an example:
+	//
+	//    metrics_relabel_configs:
+	//      # this will drop the `replica` label; enabling replica deduplication
+	//      # similar to thanos -- https://github.com/thanos-io/thanos/blob/master/docs/components/query.md#deduplication
+	//      - action: labeldrop
+	//        source_label: replica
+	//      # this will replace the `job` label with `scrape_job`
+	//      - action: replace
+	//        source_label: job
+	//        target_label: scrape_job
+	//      # this will drop the label `job`.
+	//      - action: labeldrop
+	//        source_label: job
+	//      # this will lowecase the `branch` label in-place (as source_label and target_label match)
+	//      - action: lowercase
+	//        source_label: branch
+	//        target_label: branch
+	//      # this will uppercase the `instance` label into `instanceUpper`
+	//      - action: uppercase
+	//        source_label: instance
+	//        target_label: instanceUpper
+	MetricsRelabelConfigs []*promclient.MetricRelabelConfig `yaml:"metrics_relabel_configs,omitempty"`
 	// ServiceDiscoveryConfigs is a set of ServiceDiscoveryConfig options that allow promxy to discover
 	// all hosts in the server_group
 	ServiceDiscoveryConfigs discovery.Configs `yaml:"-"`
@@ -129,6 +160,32 @@ type Config struct {
 	// An example use-case would be if a specific servergroup was was "deprecated" and wasn't getting
 	// any new data after a specific given point in time
 	AbsoluteTimeRangeConfig *AbsoluteTimeRangeConfig `yaml:"absolute_time_range"`
+
+	// LabelFilterConfig is a mechanism to restrict which queries are sent to the particular downstream.
+	// This is done by maintaining a "filter" of labels that are downstream and ensuring that the
+	// matchers for any particular query match that in-memory filter. This can be defined both
+	// statically and dynamically.
+	// NOTE: this is not a "secure" mechanism as it is relying on the query's matchers. So it is trivial
+	// for a malicious actor to work around this filter by changing matchers.
+	// Example:
+	//
+	//    label_filter:
+	//      # This will dynamically query the downstream for the values of `__name__` and `job`
+	//      dynamic_labels:
+	//        - __name__
+	//        - job
+	//      # (optional) this will define a re-sync interval for dynamic labels from the downstream
+	//      sync_interval: 5m
+	//      # This will statically define a filter of labels
+	//      static_labels_include:
+	//        instance:
+	//          - instance1
+	//      # This will statically define an exclusion list (removed from the filter)|
+	//      static_labels_exclude:
+	//        __name__:
+	//          - up
+
+	LabelFilterConfig *promclient.LabelFilterConfig `yaml:"label_filter"`
 }
 
 // GetScheme returns the scheme for this servergroup
