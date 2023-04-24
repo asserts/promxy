@@ -14,7 +14,7 @@ import (
 
 type stubAPI struct {
 	labelNames  func() []string
-	labelValues func() model.LabelValues
+	labelValues func(label string) model.LabelValues
 	query       func() model.Value
 	queryRange  func() model.Value
 	series      func() []model.LabelSet
@@ -24,36 +24,57 @@ type stubAPI struct {
 
 // LabelNames returns all the unique label names present in the block in sorted order.
 func (s *stubAPI) LabelNames(ctx context.Context, matchers []string, startTime time.Time, endTime time.Time) ([]string, v1.Warnings, error) {
+	if s.labelNames == nil {
+		return nil, nil, nil
+	}
 	return s.labelNames(), nil, nil
 }
 
 // LabelValues performs a query for the values of the given label.
 func (s *stubAPI) LabelValues(ctx context.Context, label string, matchers []string, startTime time.Time, endTime time.Time) (model.LabelValues, v1.Warnings, error) {
-	return s.labelValues(), nil, nil
+	if s.labelValues == nil {
+		return nil, nil, nil
+	}
+	return s.labelValues(label), nil, nil
 }
 
 // Query performs a query for the given time.
 func (s *stubAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+	if s.query == nil {
+		return nil, nil, nil
+	}
 	return s.query(), nil, nil
 }
 
 // QueryRange performs a query for the given range.
 func (s *stubAPI) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+	if s.queryRange == nil {
+		return nil, nil, nil
+	}
 	return s.queryRange(), nil, nil
 }
 
 // Series finds series by label matchers.
 func (s *stubAPI) Series(ctx context.Context, matches []string, startTime time.Time, endTime time.Time) ([]model.LabelSet, v1.Warnings, error) {
+	if s.series == nil {
+		return nil, nil, nil
+	}
 	return s.series(), nil, nil
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
 func (s *stubAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+	if s.getValue == nil {
+		return nil, nil, nil
+	}
 	return s.getValue(), nil, nil
 }
 
 // Metadata returns metadata about metrics currently scraped by the metric name.
 func (s *stubAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	if s.metadata == nil {
+		return nil, nil
+	}
 	return s.metadata(), nil
 }
 
@@ -130,7 +151,7 @@ func TestMultiAPIMerging(t *testing.T) {
 			return []string{"a"}
 		},
 
-		labelValues: func() model.LabelValues {
+		labelValues: func(_ string) model.LabelValues {
 			return model.LabelValues{}
 		},
 		query: func() model.Value {
@@ -184,7 +205,7 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure a single layer of multi merges
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 			}, model.Time(0), nil, 1),
@@ -201,12 +222,12 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure that a tree of multis work
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 				}, model.Time(0), nil, 1),
@@ -224,23 +245,23 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure that a multi-level tree of multis work
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
-					NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 						&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 					}, model.Time(0), nil, 1),
-					NewMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 						&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 					}, model.Time(0), nil, 1),
 				}, model.Time(0), nil, 2),
-				NewMultiAPI([]API{
-					NewMultiAPI([]API{
+				NewMustMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"b": "1"}},
 						&AddLabelClient{stub, model.LabelSet{"b": "1"}},
 					}, model.Time(0), nil, 1),
-					NewMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"b": "2"}},
 						&AddLabelClient{stub, model.LabelSet{"b": "2"}},
 					}, model.Time(0), nil, 1),
@@ -270,12 +291,12 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// In a tree, if a single node errors for each, we should still return no-error
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "2"}}, fmt.Errorf("")},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 				}, model.Time(0), nil, 1),
@@ -293,12 +314,12 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// In a tree, if any tree has all errors, we expect an error
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 				}, model.Time(0), nil, 1),
@@ -307,7 +328,7 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// if in a multi, all that "match" error, we should error
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 			}, model.Time(0), nil, 1),
@@ -315,7 +336,7 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// however, in a multi if a single one succeeds for a given "group" then it should pass
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
@@ -333,7 +354,7 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// multi with no labels
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				stub,
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},

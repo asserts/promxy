@@ -32,7 +32,8 @@ import (
 	"github.com/jacksontj/promxy/pkg/servergroup"
 )
 
-const MetricNameWorkaroundLabel = "__name"
+// metricNameWorkaroundLabel is a workaround from https://github.com/jacksontj/promxy/issues/274
+const metricNameWorkaroundLabel = "__name"
 
 type proxyStorageState struct {
 	sgs            []*servergroup.ServerGroup
@@ -104,20 +105,36 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 		cfg: c,
 	}
 	for i, sgCfg := range c.ServerGroups {
-		tmp := servergroup.New()
-		if err := tmp.ApplyConfig(sgCfg); err != nil {
+		tmp, err := servergroup.NewServerGroup()
+		if err != nil {
 			failed = true
-			logrus.Errorf("Error applying config to server group: %s", err)
+			logrus.Errorf("Error creating server group (%d): %s", i, err)
+			// We can continue to other as we don't need to cancel this as we didn't ApplyConfig()
+			continue
 		}
+		// Once the ServerGroup was created; we want to add this to the lists as there
+		// are background goroutines launched (so we'd need to cancel)
 		newState.sgs[i] = tmp
 		apis[i] = tmp
-	}
-	newState.client = promclient.NewTimeTruncate(promclient.NewMultiAPI(apis, model.TimeFromUnix(0), nil, len(apis)))
 
+		if err := tmp.ApplyConfig(sgCfg); err != nil {
+			failed = true
+			logrus.Errorf("Error applying config to server group (%d): %s", i, err)
+		}
+	}
+
+	// If there was a failure anywhere, we need to cancel the newState and return an error
 	if failed {
 		newState.Cancel(nil)
 		return fmt.Errorf("error applying config to one or more server group(s)")
 	}
+
+	multiApi, err := promclient.NewMultiAPI(apis, model.TimeFromUnix(0), nil, len(apis))
+	if err != nil {
+		return err
+	}
+
+	newState.client = promclient.NewTimeTruncate(multiApi)
 
 	// Check for remote_write (for appender)
 	if c.PromConfig.RemoteWriteConfigs != nil {
@@ -155,6 +172,7 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 	return nil
 }
 
+// ConfigHandler is an implementation of the config handler within the prometheus API
 func (p *ProxyStorage) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 	state := p.GetState()
 	v := map[string]interface{}{
@@ -262,16 +280,14 @@ func (p *ProxyStorage) Appender(context.Context) storage.Appender {
 // Close releases the resources of the Querier.
 func (p *ProxyStorage) Close() error { return nil }
 
+// ChunkQuerier returns a new ChunkQuerier on the storage.
 func (p *ProxyStorage) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
 	return nil, errors.New("not implemented")
 }
 
+// ExemplarQuerier returns a new ExemplarQuerier on the storage.
 func (p *ProxyStorage) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
 	return nil, errors.New("not implemented")
-}
-
-func (p *ProxyStorage) WALReplayStatus() (tsdb.WALReplayStatus, error) {
-	return tsdb.WALReplayStatus{}, errors.New("not implemented")
 }
 
 // Implement web.LocalStorage
@@ -280,6 +296,9 @@ func (p *ProxyStorage) Delete(mint, maxt int64, ms ...*labels.Matcher) error { r
 func (p *ProxyStorage) Snapshot(dir string, withHead bool) error             { return nil }
 func (p *ProxyStorage) Stats(statsByLabelName string) (*tsdb.Stats, error) {
 	return &tsdb.Stats{IndexPostingStats: &index.PostingsStats{}}, nil
+}
+func (p *ProxyStorage) WALReplayStatus() (tsdb.WALReplayStatus, error) {
+	return tsdb.WALReplayStatus{}, errors.New("not implemented")
 }
 
 // NodeReplacer replaces promql Nodes with more efficient-to-fetch ones. This works by taking lower-layer
@@ -418,7 +437,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 				replacedGrouping := make([]string, len(n.Grouping))
 				for i, g := range n.Grouping {
 					if g == model.MetricNameLabel {
-						replacedGrouping[i] = MetricNameWorkaroundLabel
+						replacedGrouping[i] = metricNameWorkaroundLabel
 					} else {
 						replacedGrouping[i] = g
 					}
@@ -430,7 +449,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 						Op: parser.DIV,
 						LHS: &parser.AggregateExpr{
 							Op:       parser.SUM,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, MetricNameWorkaroundLabel),
+							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
@@ -438,13 +457,13 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 						RHS: &parser.AggregateExpr{
 							Op:       parser.COUNT,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, MetricNameWorkaroundLabel),
+							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
 						},
 						VectorMatching: &parser.VectorMatching{Card: parser.CardOneToOne},
-					}, MetricNameWorkaroundLabel, model.MetricNameLabel),
+					}, metricNameWorkaroundLabel, model.MetricNameLabel),
 					Grouping: n.Grouping,
 					Without:  n.Without,
 				}, nil
@@ -562,6 +581,15 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	// prometheus node to answer
 	case *parser.Call:
 		logrus.Debugf("call %v %v", n, n.Type())
+
+		// absent and absent_over_time are difficult to implement at this layer; and as such we won't touch them
+		// we'll do our NodeReplace at another node in the tree
+		switch n.Func.Name {
+		case "absent", "absent_over_time":
+			return nil, nil
+		}
+
+		// For all the Call's we actually will work on, we need to remove the offset
 		removeOffsetFn()
 
 		var result model.Value
@@ -590,16 +618,15 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		ret := &parser.VectorSelector{OriginalOffset: offset}
 		ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
 
+		// Some functions require specific handling which we'll catch here
+		switch n.Func.Name {
 		// the "scalar()" function is a bit tricky. It can return a scalar or a vector.
 		// So to handle this instead of returning the vector directly (as its just the values selected)
 		// we can set it as the args (the vector of data) and the promql engine handles the types properly
-		if n.Func.Name == "scalar" {
+		case "scalar":
 			n.Args[0] = ret
 			return nil, nil
-		}
-
 		// the functions of sort() and sort_desc() need whole results to calculate.
-		switch n.Func.Name {
 		case "sort", "sort_desc":
 			return &parser.Call{
 				Func: n.Func,
